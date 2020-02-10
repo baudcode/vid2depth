@@ -1,4 +1,4 @@
-from .warping import inverse_warp
+from . import warping
 
 import tensorflow as tf
 from tensorflow.keras.layers import AveragePooling2D
@@ -25,7 +25,16 @@ def depth_smoothness(depth, img):
     return tf.reduce_mean(abs(smoothness_x)) + tf.reduce_mean(abs(smoothness_y))
 
 
-def ssim(x, y):
+def reconstruction_loss(warped_image, warped_mask, target):
+    error = tf.abs(warped_image - target)
+    return tf.reduce_mean(error * warped_mask)
+
+
+def depth_smoothness_loss(depth, img, s):
+    return 1.0 / (2**s) * depth_smoothness(depth, img)
+
+
+def ssim_loss(x, y):
     """Computes a differentiable structured image similarity measure."""
     c1 = 0.01**2
     c2 = 0.03**2
@@ -39,6 +48,90 @@ def ssim(x, y):
     ssim_d = (mu_x**2 + mu_y**2 + c1) * (sigma_x + sigma_y + c2)
     ssim = ssim_n / ssim_d
     return tf.clip_by_value((1 - ssim) / 2, 0, 1)
+
+
+def chamfer_distance(pc1, pc2, norm=2, egomotion=None, debug=False):
+    """Computes the Chamfer Distance
+
+    Measures the distance between two point clouds.
+    Calculates average minimum distance for each point to the nearest point of the other pointcloud.
+    Optional egomotion vector with shape [B,6] that transforms pc1. 
+
+    Arguments:
+        pc1 {tf.Tensor} -- pointcloud 1 of shape [B, N, ?]
+        pc2 {tf.Tensor} -- pointcloud 2 of shape [B, N, ?]
+        norm {int} -- int, if 2 -> mse distance, 1 -> abs distance (default: {2})
+        egomotion {tf.Tensor} -- egomotion vector of shape [B, 6] (default: {None})
+        debug {bool} -- debug shapes
+
+    Returns:
+        {float}: chamfer mean distance
+    """
+    t1 = tf.convert_to_tensor(pc1)
+    t2 = tf.convert_to_tensor(pc2)
+    inshape = t1.get_shape().as_list()
+    B, N, _ = inshape
+
+    ## if egomotion is supplied, transform pc1 by egomotion
+    if egomotion is not None:
+        egomotion_mat = warping._egomotion_vec2mat(egomotion, B)
+
+        # euclid -> homo
+        t1 = tf.concat([t1, tf.ones([B, N, 1])], axis=2)
+
+        # transform first pc by egomotion
+        t1 = tf.transpose(tf.matmul(egomotion_mat, tf.transpose(t1)))
+
+        # homo -> euclid
+        t1 = t1 / tf.tile(tf.expand_dims(t1[:, :, 3], 2), [1, 1, 4])
+        t1 = t1[:, :, :3]
+
+    mmax = tf.reduce_max([tf.reduce_max(t1), tf.reduce_max(t2)])
+    t1 /= mmax  # norm to soft [0,1]
+    t2 /= mmax
+
+    B, N1, _ = t1.get_shape().as_list()
+    B, N2, _ = t2.get_shape().as_list()
+
+    if debug:
+        tf.print('pc1', t1.get_shape().as_list())
+        tf.print('pc2', t2.get_shape().as_list())
+
+    ## for each point of pc1 , find shortest euclidian distance to any point of pc2
+    # make matrix [n,n] with each element being euclidian distance (i,j)
+    # for each line take minimum
+    # mean row
+    x1, y1, z1 = t1[:, :, 0], t1[:, :, 1], t1[:, :, 2]
+    x2, y2, z2 = t2[:, :, 0], t2[:, :, 1], t2[:, :, 2]
+    [x1, y1, z1, x2, y2, z2] = [tf.cast(tf.reshape(_a, [B, N1, 1]), tf.float32) for _a in [x1, y1, z1, x2, y2, z2]]
+
+    ## span up big mats
+    xx1 = tf.matmul(x1, tf.ones((B, 1, N2), tf.float32))
+    yy1 = tf.matmul(y1, tf.ones((B, 1, N2), tf.float32))
+    zz1 = tf.matmul(z1, tf.ones((B, 1, N2), tf.float32))
+    xx2 = tf.matmul(x2, tf.ones((B, 1, N1), tf.float32))
+    yy2 = tf.matmul(y2, tf.ones((B, 1, N1), tf.float32))
+    zz2 = tf.matmul(z2, tf.ones((B, 1, N1), tf.float32))
+
+    ## calc differences and distances
+    dxx = xx2 - xx1
+    dyy = yy2 - yy1
+    dzz = zz2 - zz1
+
+    if norm == 2:
+        distance_mat = tf.sqrt(1e-7 + dxx * dxx + dyy * dyy + dzz * dzz)
+    elif norm == 1:
+        distance_mat = tf.abs(dxx) + tf.abs(dyy) + tf.abs(dzz) + 1e-7
+
+    ## calc avg minimum distance for each point
+    min_distances = tf.reduce_min(distance_mat, axis=1)
+    chamfer = tf.reduce_mean(min_distances, axis=1)
+
+    if debug:
+        tf.print('distance_mat', distance_mat.get_shape().as_list())
+        tf.print('min_distances', min_distances.get_shape().as_list())
+        tf.print('chamfer', chamfer.get_shape().as_list())
+    return chamfer
 
 
 def loss_fn(x, output, reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.05,
@@ -72,7 +165,7 @@ def loss_fn(x, output, reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.0
         # smoothness
         if smooth_weight > 0:
             for i in range(seq_length):
-                losses['smooth'] += 1.0 / (2**s) * depth_smoothness(output['disparities'][i][s], scaled_images[s][:, :, :, 3 * i:3 * (i + 1)])
+                losses['smooth'] += depth_smoothness_loss(output['disparities'][i][s], scaled_images[s][:, :, :, 3 * i:3 * (i + 1)], s)
 
         for i in range(seq_length):
             for j in range(seq_length):
@@ -97,11 +190,11 @@ def loss_fn(x, output, reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.0
 
                 # Inverse warp the source image to the target image frame for
                 # photometric consistency loss.
-                wimage, wmask = inverse_warp(source,
-                                             target_depth,
-                                             egomotion,
-                                             intrinsic_mat[:, s, :, :],
-                                             intrinsic_mat_inv[:, s, :, :])
+                wimage, wmask = warping.inverse_warp(source,
+                                                     target_depth,
+                                                     egomotion,
+                                                     intrinsic_mat[:, s, :, :],
+                                                     intrinsic_mat_inv[:, s, :, :])
 
                 warped_images[s][key] = wimage
                 warped_masks[s][key] = wmask
@@ -112,7 +205,7 @@ def loss_fn(x, output, reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.0
 
                 # SSIM.
                 if ssim_weight > 0:
-                    ssim_errors[s][key] = ssim(warped_images[s][key], target)
+                    ssim_errors[s][key] = ssim_loss(warped_images[s][key], target)
 
                     # TODO(rezama): This should be min_pool2d().
                     ssim_mask = AveragePooling2D(3, 1, 'VALID')(warped_masks[s][key])
