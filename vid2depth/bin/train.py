@@ -135,7 +135,7 @@ def train_model(args):
     tfds = tfds.batch(args.batch_size)
     tfds = tfds.repeat().shuffle(args.shuffle_buffer_size).prefetch(args.buffer_size)
 
-    if args.steps_per_epoch:
+    if args.steps_per_epoch > 0:
         steps_per_epoch = args.steps_per_epoch
     else:
         steps_per_epoch = ds.num_examples(DataType.TRAIN) // args.batch_size
