@@ -219,7 +219,7 @@ def loss_fn(x, output, reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.0
 
     loss_data = {
         "scaled_images": scaled_images,
-        "warped_images": warped_masks,
+        "warped_images": warped_images,
         "warped_masks": warped_masks,
         "warped_errors": warped_errors,
         "ssim_errors": ssim_errors
