@@ -43,6 +43,7 @@ def train(ds, model, steps_per_epoch=1000, logdir='./logs', epochs=10, lr=0.0002
           reconstr_weight=0.85, ssim_weight=0.15, smooth_weight=0.05,
           batch_size=1, height=128, width=416, seq_length=3, num_scales=4, l2=0.05):
 
+    @tf.function
     def grad(model, x):
         with tf.GradientTape() as tape:
             output = model(x, training=True)
@@ -61,6 +62,7 @@ def train(ds, model, steps_per_epoch=1000, logdir='./logs', epochs=10, lr=0.0002
     step = 0
 
     with writer.as_default():
+
         for epoch in range(epochs):
             epoch_loss_avg = tf.keras.metrics.Mean()
             with tqdm.tqdm(total=steps_per_epoch, unit='step', desc='training epoch %d' % epoch) as tq:
@@ -86,7 +88,7 @@ def train(ds, model, steps_per_epoch=1000, logdir='./logs', epochs=10, lr=0.0002
                 if epoch % 1 == 0:
                     print("Epoch {:03d}: Loss: {:.3f}".format(epoch, epoch_loss_avg.result()))
 
-    print(train_loss_results)
+    return train_loss_results
 
 
 def get_args(args=None):
@@ -94,6 +96,7 @@ def get_args(args=None):
     # training parameters
     parser.add_argument('-bs', '--batch_size', type=int, default=1, help='batch size')
     parser.add_argument('-e', '--epochs', type=int, default=1, help='number of epochs')
+    parser.add_argument('-steps', '--steps_per_epoch', type=int, default=-1, help='steps per epoch, if -1, calculate from dataset')
     parser.add_argument('-l', '--logdir', default='./logs', help='log directory')
     parser.add_argument('-sfreq', '--summary_freq', type=int, default=100, help='summary frequency steps')
 
@@ -112,6 +115,7 @@ def get_args(args=None):
     parser.add_argument('-se', '--sample_every', type=int, default=6, help='sample every x frames')
     parser.add_argument('-d', '--data_dir', type=str, required=True, help='data directory')
     parser.add_argument('-shubufsize', '--shuffle_buffer_size', type=int, default=50, help='shuffle buffer size')
+    parser.add_argument('-bufsize', '--buffer_size', type=int, default=25, help='buffer size')
 
     return parser.parse_args(args=args)
 
@@ -129,17 +133,34 @@ def train_model(args):
 
     # batch, cache, repeat, shuffle, prefetch
     tfds = tfds.batch(args.batch_size)
-    tfds = tfds.cache().repeat().shuffle(args.shuffle_buffer_size).prefetch(tf.data.experimental.AUTOTUNE)
+    tfds = tfds.repeat().shuffle(args.shuffle_buffer_size).prefetch(args.buffer_size)
 
-    steps_per_epoch = ds.num_examples(DataType.TRAIN) // args.batch_size
+    if args.steps_per_epoch:
+        steps_per_epoch = args.steps_per_epoch
+    else:
+        steps_per_epoch = ds.num_examples(DataType.TRAIN) // args.batch_size
 
     # create the model and train
-    model = vid2depth(args.height, args.width, seq_length=args.seq_length, l2=args.weight_norm)
+    model, submodels = vid2depth(args.height, args.width, seq_length=args.seq_length, l2=args.weight_norm)
 
-    train(tfds, model, steps_per_epoch=steps_per_epoch, logdir=args.logdir, epochs=args.epochs, batch_size=args.batch_size,
-          lr=args.learning_rate, beta1=args.beta1, summary_freq=args.summary_freq,
-          reconstr_weight=args.reconstr_weight, ssim_weight=args.ssim_weight, smooth_weight=args.smooth_weight,
-          height=args.height, width=args.width, seq_length=args.seq_length, num_scales=NUM_SCALES, l2=args.weight_norm)
+    r = train(tfds, model, steps_per_epoch=steps_per_epoch, logdir=args.logdir, epochs=args.epochs, batch_size=args.batch_size,
+              lr=args.learning_rate, beta1=args.beta1, summary_freq=args.summary_freq,
+              reconstr_weight=args.reconstr_weight, ssim_weight=args.ssim_weight, smooth_weight=args.smooth_weight,
+              height=args.height, width=args.width, seq_length=args.seq_length, num_scales=NUM_SCALES, l2=args.weight_norm)
+
+    # saving model and weights
+    model_path = os.path.join(args.logdir, 'model.h5')
+    logger.info("saving model to %s" % model_path)
+    model.save(model_path)
+
+    model_weights_path = os.path.join(args.logdir, 'weights.h5')
+    logger.info("saving weights to %s" % model_weights_path)
+    model.save_weights(model_weights_path)
+
+    for name, submodel in submodels.items():
+        submodel_weights_path = os.path.join(args.logdir, '%s-weights.h5' % name)
+        logger.info("saving submodel weights %s to %s" % (name, submodel_weights_path))
+        submodel.save_weights(submodel_weights_path)
 
 
 def main():
